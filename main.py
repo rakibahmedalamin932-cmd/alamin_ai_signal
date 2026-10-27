@@ -219,23 +219,21 @@ def get_signal(df):
     if bool(x.bull_engulf or x.bull_pin): call += 1
     if bool(x.bear_engulf or x.bear_pin): put += 1
 
-    # Volatility guard: avoid extremely tiny or oversized candle relative to ATR
-    candle_range = float(x["high"] - x["low"])
-    if not np.isfinite(x.atr) or x.atr <= 0 or candle_range > 2.5*x.atr:
-        return None, max(call, put), "Volatility guard"
-
-    if call >= MIN_SCORE and call > put:
+    # Always produce a direction when valid candle data and indicators exist.
+    # Note: this increases signal frequency, NOT guaranteed accuracy.
+    if call > put:
         return "CALL", call, "Trend + Momentum + Price Action"
-    if put >= MIN_SCORE and put > call:
+    if put > call:
         return "PUT", put, "Trend + Momentum + Price Action"
 
-    # This bot is configured to emit only CALL/PUT; use directional majority if no score threshold.
-    # This fallback is intentionally marked low-confidence in the message.
-    if call > put:
-        return "CALL", call, "Directional fallback (low confidence)"
-    if put > call:
-        return "PUT", put, "Directional fallback (low confidence)"
-    return None, max(call, put), "No directional agreement"
+    # Tie-break using the short-term trend, then price vs EMA50.
+    if x.ema9 > x.ema21:
+        return "CALL", call, "EMA tie-break"
+    if x.ema9 < x.ema21:
+        return "PUT", put, "EMA tie-break"
+    if x.close >= x.ema50:
+        return "CALL", call, "EMA50 tie-break"
+    return "PUT", put, "EMA50 tie-break"
 
 
 def make_chart(df, pair, direction):
