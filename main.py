@@ -255,12 +255,14 @@ def make_chart(df, pair, direction):
 
 
 def send_signal(pair, df, direction, score, strategy, state):
+    """Send one text signal and return its scheduled trade details."""
     now = datetime.now(TZ)
-    entry = (now.replace(second=0, microsecond=0) + timedelta(minutes=1))
+    entry = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
     closing = entry + timedelta(minutes=1)
     key = f"{pair}|{entry.strftime('%Y-%m-%d %H:%M')}"
     if key in state["sent_keys"]:
-        return
+        logging.info("Duplicate signal suppressed: %s", key)
+        return None
 
     message = (
         f"PAIR : {pair}\n"
@@ -269,79 +271,91 @@ def send_signal(pair, df, direction, score, strategy, state):
         f"DIRECTION : {direction}\n\n"
         f"SIGNAL BY - {SIGNAL_BY}"
     )
-    # Send the actual signal as plain text first so chart generation/upload
-    # cannot prevent the primary signal from reaching Telegram.
     send_text(message)
-    try:
-        chart_path = make_chart(df, pair, direction)
-        with open(chart_path, "rb") as photo:
-            telegram("sendPhoto", chat_id=CHAT_ID, photo=photo, caption=f"{pair} | {direction} | 1-minute chart")
-    except Exception:
-        logging.exception("Chart creation/upload failed for %s; text signal was already sent", pair)
-
     state["sent_keys"].append(key)
     state["sent_keys"] = state["sent_keys"][-500:]
-    state["pending"].append({
-        "pair": pair,
-        "entry_time": entry.isoformat(),
-        "closing_time": closing.isoformat(),
-        "direction": direction,
-        "entry_price": None,
-        "checked": False,
-        "created_at": now.isoformat(),
-    })
     save_state(state)
     logging.info("Signal sent: %s %s score=%s strategy=%s", pair, direction, score, strategy)
 
+    return {
+        "pair": pair,
+        "entry_time": entry,
+        "closing_time": closing,
+        "direction": direction,
+    }
 
-def settle_pending(state):
-    now = datetime.now(TZ)
-    changed = False
-    for item in state["pending"]:
-        if item.get("checked"):
-            continue
-        close_at = datetime.fromisoformat(item["closing_time"])
-        if now < close_at + timedelta(seconds=5):
-            continue
+
+def wait_for_result(trade, state, max_wait_seconds=300):
+    """
+    Wait for the scheduled entry-minute candle to finish and become available.
+    Evaluate that candle's open vs close for a consistent 1-minute result.
+    """
+    entry_time = trade["entry_time"]
+    deadline = time.time() + max_wait_seconds
+    last_error = None
+
+    # Wait until the scheduled one-minute candle should have closed.
+    wait_seconds = max(0, (trade["closing_time"] - datetime.now(TZ)).total_seconds()) + 8
+    if wait_seconds > 0:
+        time.sleep(min(wait_seconds, max_wait_seconds))
+
+    while time.time() < deadline:
         try:
-            df = fetch_candles(item["pair"])
-            # Candle whose timestamp is the scheduled entry minute, and closing minute.
-            times = pd.to_datetime(df["datetime"])
-            entry_dt = datetime.fromisoformat(item["entry_time"]).replace(tzinfo=None)
-            close_dt = close_at.replace(tzinfo=None)
-            entry_rows = df[times == pd.Timestamp(entry_dt)]
-            close_rows = df[times == pd.Timestamp(close_dt)]
-            if entry_rows.empty or close_rows.empty:
-                logging.warning("Result candles not yet available for %s", item["pair"])
-                continue
-            entry_price = float(entry_rows.iloc[0]["open"])
-            exit_price = float(close_rows.iloc[0]["close"])
-            win = (exit_price > entry_price) if item["direction"] == "CALL" else (exit_price < entry_price)
-            if win:
-                state["wins"] += 1
-                result = "WIN"
-            else:
-                state["losses"] += 1
-                result = "LOSS"
-            item["entry_price"] = entry_price
-            item["exit_price"] = exit_price
-            item["checked"] = True
-            msg = (
-                f"PAIR : {item['pair']}\n"
-                f"ENTRY TIME : {close_at.strftime('%H:%M')}\n"
-                f"RESULT : {result}\n"
-                f"WIN : {state['wins']}\n"
-                f"LOSS : {state['losses']}\n\n"
-                f"SIGNAL BY {SIGNAL_BY}"
-            )
-            send_text(msg)
-            changed = True
-        except Exception as exc:
-            logging.exception("Could not settle %s: %s", item["pair"], exc)
-    state["pending"] = [p for p in state["pending"] if not p.get("checked")]
-    if changed:
-        save_state(state)
+            df = fetch_candles(trade["pair"])
+            times = pd.to_datetime(df["datetime"], errors="coerce")
+            entry_naive = pd.Timestamp(entry_time.replace(tzinfo=None))
+            rows = df[times == entry_naive]
+            if not rows.empty:
+                candle = rows.iloc[0]
+                open_price = float(candle["open"])
+                close_price = float(candle["close"])
 
+                if close_price > open_price:
+                    candle_direction = "CALL"
+                elif close_price < open_price:
+                    candle_direction = "PUT"
+                else:
+                    candle_direction = "DOJI"
+
+                if candle_direction == "DOJI":
+                    # Flat candle is counted as LOSS for conservative, deterministic accounting.
+                    result = "LOSS"
+                    state["losses"] += 1
+                elif candle_direction == trade["direction"]:
+                    result = "WIN"
+                    state["wins"] += 1
+                else:
+                    result = "LOSS"
+                    state["losses"] += 1
+
+                message = (
+                    f"PAIR : {trade['pair']}\n"
+                    f"ENTRY TIME : {entry_time.strftime('%H:%M')}\n"
+                    f"RESULT : {result}\n"
+                    f"WIN : {state['wins']}\n"
+                    f"LOSS : {state['losses']}\n\n"
+                    f"SIGNAL BY {SIGNAL_BY}"
+                )
+                send_text(message)
+                save_state(state)
+                logging.info("Result sent: %s %s open=%s close=%s", trade["pair"], result, open_price, close_price)
+                return True
+
+            last_error = "Scheduled entry candle not available yet"
+        except Exception as exc:
+            last_error = str(exc)
+            logging.warning("Waiting for result candle (%s): %s", trade["pair"], exc)
+        time.sleep(10)
+
+    diagnostic = (
+        f"ALAMIN SIGNAL BOT - RESULT UNAVAILABLE\n"
+        f"PAIR : {trade['pair']}\n"
+        f"ENTRY TIME : {entry_time.strftime('%H:%M')}\n"
+        f"Could not verify result from Twelve Data.\n"
+        f"Reason : {(last_error or 'candle unavailable')[:180]}"
+    )
+    send_text(diagnostic)
+    return False
 
 def main():
     if not API_KEY:
@@ -352,30 +366,54 @@ def main():
         raise SystemExit("TELEGRAM_CHAT_ID missing in environment / GitHub Secrets")
 
     state = load_state()
-    settle_pending(state)
-    sent_before = len(state["sent_keys"])
+    candidates = []
     errors = []
+
+    # Analyze every configured pair, but only send ONE best signal per run.
     for pair in PAIRS:
         try:
             df = fetch_candles(pair)
             direction, score, strategy = get_signal(df)
-            if direction is None:
-                logging.warning("No signal for %s: %s", pair, strategy)
-                errors.append(f"{pair}: no direction returned ({strategy})")
-                continue
-            send_signal(pair, df, direction, score, strategy, state)
+            if direction:
+                candidates.append({
+                    "pair": pair,
+                    "df": df,
+                    "direction": direction,
+                    "score": score,
+                    "strategy": strategy,
+                })
+                logging.info("Analysis %s: %s score=%s strategy=%s", pair, direction, score, strategy)
+            else:
+                errors.append(f"{pair}: no signal ({strategy})")
         except Exception as exc:
             logging.exception("Pair failed (%s): %s", pair, exc)
-            errors.append(f"{pair}: {str(exc)[:180]}")
+            errors.append(f"{pair}: {str(exc)[:160]}")
         time.sleep(1)
 
-    # If no new signal was sent, send a concise diagnostic so the bot does not
-    # appear silent. This is not a trading signal.
-    if len(state["sent_keys"]) == sent_before and errors:
+    if not candidates:
         try:
-            send_text("ALAMIN SIGNAL BOT - DIAGNOSTIC\nNo signal sent this run.\n" + "\n".join(errors[:4]))
+            send_text(
+                "ALAMIN SIGNAL BOT - NO SIGNAL\n"
+                "No valid market analysis was available this run.\n"
+                + ("\n".join(errors[:4]) if errors else "Please check market data.")
+            )
         except Exception:
-            logging.exception("Could not send diagnostic message to Telegram")
+            logging.exception("Could not send no-signal diagnostic")
+        save_state(state)
+        return
+
+    # Highest score wins. Stable order breaks ties.
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    best = candidates[0]
+    trade = send_signal(
+        best["pair"], best["df"], best["direction"],
+        best["score"], best["strategy"], state
+    )
+    if trade is None:
+        return
+
+    # Keep this workflow run alive until the trade's result is available.
+    wait_for_result(trade, state)
     save_state(state)
 
 
