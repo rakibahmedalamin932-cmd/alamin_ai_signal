@@ -1,17 +1,24 @@
 """
 ALAMIN AI SIGNAL BOT
-Strategy: EMA 9/21 + RSI 14 + MACD + ADX 14 + ATR + candle confirmation
-Backtesting: historical one-candle expiry, win rate, wins/losses and payout-adjusted P/L.
+- Compact Telegram signal format
+- EMA 9/21 + RSI + MACD + ADX + ATR + candle confirmation
+- Historical backtest command: /backtest and /backtest EURUSD
+- Automatic one-candle result message, exactly once per signal ID while state persists
+- Win rate and profit/loss calculated from completed signals and configured payout
 
-IMPORTANT:
-- This is an experimental educational signal bot, NOT a guarantee of profitable trades.
-- Public Yahoo Finance 1-minute history is limited and may differ from broker/Quotex prices.
-- OTC prices are not reliably available from Yahoo Finance; OTC pairs are intentionally excluded.
-- Signals are based on completed candles. Backtest uses the next candle close as expiry.
+Important:
+* Experimental tool, not financial advice and no accuracy/profit is guaranteed.
+* Yahoo Finance data is not the same as a broker feed and does not provide reliable OTC prices.
+* This bot stores state in state.json. GitHub-hosted runners may discard local files between runs;
+  for continuous, duplicate-safe operation use a persistent host or persist state.json between runs.
+* A signal is generated from a completed candle; result is checked against the next candle close.
 """
 
 import os
+import json
 import logging
+import asyncio
+from pathlib import Path
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -24,11 +31,10 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# -------------------- CONFIG --------------------
+# ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Yahoo Finance symbols. Add/remove symbols as needed.
 PAIRS = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
@@ -37,27 +43,56 @@ PAIRS = {
 }
 
 INTERVAL = os.getenv("INTERVAL", "1m")
-PERIOD = os.getenv("PERIOD", "7d")  # Yahoo 1-minute history is limited.
-EXPIRY_CANDLES = 1
-PAYOUT = float(os.getenv("PAYOUT", "0.80"))  # 0.80 = 80% profit on a win
-STAKE = float(os.getenv("STAKE", "1.00"))    # Backtest accounting only
+PERIOD = os.getenv("PERIOD", "7d")
+PAYOUT = float(os.getenv("PAYOUT", "0.80"))  # 0.80 means 80% net profit on a win
+STAKE = float(os.getenv("STAKE", "1.00"))    # result accounting currency/unit
 MIN_SCORE = int(os.getenv("MIN_SCORE", "4"))
-SIGNAL_INTERVAL_SECONDS = 60
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+SIGNAL_LOOP_SECONDS = int(os.getenv("SIGNAL_LOOP_SECONDS", "30"))
+STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("alamin-signal")
 
-# Avoid duplicate signal messages for the same completed candle.
-LAST_SENT = {}
+# state schema:
+# {
+#   "last_signal_candle": {"EUR/USD": "timestamp"},
+#   "pending": {"signal_id": {...}},
+#   "completed": {"signal_id": {...}}
+# }
+STATE = {"last_signal_candle": {}, "pending": {}, "completed": {}}
+STATE_LOCK = asyncio.Lock()
 
 
-# -------------------- MARKET DATA --------------------
+def load_state():
+    global STATE
+    try:
+        if STATE_FILE.exists():
+            loaded = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                STATE = {
+                    "last_signal_candle": loaded.get("last_signal_candle", {}),
+                    "pending": loaded.get("pending", {}),
+                    "completed": loaded.get("completed", {}),
+                }
+    except Exception:
+        log.exception("Could not load state file; starting with empty state.")
+    for key in ("last_signal_candle", "pending", "completed"):
+        if not isinstance(STATE.get(key), dict):
+            STATE[key] = {}
+
+
+def save_state():
+    """Atomic local state write to reduce corruption risk."""
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(STATE, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(STATE_FILE)
+
+
+# ---------------- MARKET DATA ----------------
 def download_candles(symbol: str, period: str = PERIOD, interval: str = INTERVAL):
-    """Download OHLC candles from Yahoo Finance."""
     df = yf.download(
         symbol,
         period=period,
@@ -68,33 +103,25 @@ def download_candles(symbol: str, period: str = PERIOD, interval: str = INTERVAL
     )
     if df is None or df.empty:
         raise ValueError(f"No market data returned for {symbol}")
-
-    # yfinance can return MultiIndex columns depending on version/symbol.
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-
-    needed = ["Open", "High", "Low", "Close"]
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns {missing} for {symbol}")
-
-    df = df[needed].copy()
-    for col in needed:
+    cols = ["Open", "High", "Low", "Close"]
+    if any(c not in df.columns for c in cols):
+        raise ValueError(f"OHLC columns missing for {symbol}")
+    df = df[cols].copy()
+    for col in cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df = df.dropna().sort_index()
     df = df[~df.index.duplicated(keep="last")]
-
     if len(df) < 80:
         raise ValueError(f"Not enough candles for {symbol}: {len(df)}")
     return df
 
 
-# -------------------- INDICATORS & STRATEGY --------------------
+# ---------------- INDICATORS ----------------
 def add_indicators(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
+    close, high, low = df["Close"], df["High"], df["Low"]
 
     df["EMA9"] = close.ewm(span=9, adjust=False).mean()
     df["EMA21"] = close.ewm(span=21, adjust=False).mean()
@@ -105,14 +132,11 @@ def add_indicators(raw: pd.DataFrame) -> pd.DataFrame:
     avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, float("nan"))
-    df["RSI"] = 100 - (100 / (1 + rs))
-    df["RSI"] = df["RSI"].fillna(50)
+    df["RSI"] = (100 - 100 / (1 + rs)).fillna(50)
 
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
-    df["MACD"] = ema12 - ema26
-    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
+    df["MACD_HIST"] = (ema12 - ema26) - (ema12 - ema26).ewm(span=9, adjust=False).mean()
 
     prev_close = close.shift(1)
     tr = pd.concat(
@@ -121,10 +145,10 @@ def add_indicators(raw: pd.DataFrame) -> pd.DataFrame:
     ).max(axis=1)
     df["ATR"] = tr.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
 
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    up = high.diff()
+    down = -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
     atr_safe = df["ATR"].replace(0, float("nan"))
     plus_di = 100 * plus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean() / atr_safe
     minus_di = 100 * minus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean() / atr_safe
@@ -133,300 +157,355 @@ def add_indicators(raw: pd.DataFrame) -> pd.DataFrame:
     df["PLUS_DI"] = plus_di.fillna(0)
     df["MINUS_DI"] = minus_di.fillna(0)
 
-    df["ATR_PCT"] = (df["ATR"] / close.abs().replace(0, float("nan")) * 100).fillna(0)
     df["BODY"] = (df["Close"] - df["Open"]).abs()
-    df["BULL_CANDLE"] = df["Close"] > df["Open"]
-    df["BEAR_CANDLE"] = df["Close"] < df["Open"]
     df["AVG_BODY"] = df["BODY"].rolling(20).mean()
     return df
 
 
 def evaluate_row(row: pd.Series):
-    """
-    Returns CALL/PUT or None plus a transparent explanation.
-    Filters are conservative; a signal is not guaranteed to win.
-    """
-    required = ["EMA9", "EMA21", "RSI", "MACD_HIST", "ADX", "ATR", "AVG_BODY"]
-    if any(pd.isna(row.get(k)) for k in required):
-        return None, 0, "Indicator warm-up"
+    needed = ["EMA9", "EMA21", "RSI", "MACD_HIST", "ADX", "ATR", "AVG_BODY"]
+    if any(pd.isna(row.get(k)) for k in needed):
+        return None, 0
 
-    # Avoid very weak trend conditions and tiny/abnormally large candles.
-    if row["ADX"] < 15:
-        return None, 0, "ADX too weak"
-    if row["ATR"] <= 0 or row["AVG_BODY"] <= 0:
-        return None, 0, "Invalid volatility"
+    if row["ADX"] < 15 or row["ATR"] <= 0 or row["AVG_BODY"] <= 0:
+        return None, 0
     if row["BODY"] > row["ATR"] * 1.8:
-        return None, 0, "Large candle filter"
+        return None, 0
 
-    call_score = 0
-    put_score = 0
-
-    # Trend
+    call = put = 0
     if row["EMA9"] > row["EMA21"]:
-        call_score += 1
+        call += 1
     elif row["EMA9"] < row["EMA21"]:
-        put_score += 1
+        put += 1
 
-    # RSI momentum: avoid chasing extreme readings.
     if 52 <= row["RSI"] <= 68:
-        call_score += 1
+        call += 1
     elif 32 <= row["RSI"] <= 48:
-        put_score += 1
+        put += 1
 
-    # MACD momentum
     if row["MACD_HIST"] > 0:
-        call_score += 1
+        call += 1
     elif row["MACD_HIST"] < 0:
-        put_score += 1
+        put += 1
 
-    # Directional strength
     if row["PLUS_DI"] > row["MINUS_DI"]:
-        call_score += 1
+        call += 1
     elif row["MINUS_DI"] > row["PLUS_DI"]:
-        put_score += 1
+        put += 1
 
-    # Candle confirmation
-    if bool(row["BULL_CANDLE"]):
-        call_score += 1
-    elif bool(row["BEAR_CANDLE"]):
-        put_score += 1
+    if row["Close"] > row["Open"]:
+        call += 1
+    elif row["Close"] < row["Open"]:
+        put += 1
 
-    # Require multiple confirmations and a score difference.
-    if call_score >= MIN_SCORE and call_score >= put_score + 2:
-        return "CALL", call_score, "Bullish trend + momentum confirmation"
-    if put_score >= MIN_SCORE and put_score >= call_score + 2:
-        return "PUT", put_score, "Bearish trend + momentum confirmation"
-    return None, max(call_score, put_score), "No clear confirmation"
+    if call >= MIN_SCORE and call >= put + 2:
+        return "CALL", call
+    if put >= MIN_SCORE and put >= call + 2:
+        return "PUT", put
+    return None, max(call, put)
 
 
-def build_signal(df: pd.DataFrame):
-    """Use last completed candle; the final downloaded candle may still be forming."""
-    if len(df) < 3:
+def build_latest_signal(raw: pd.DataFrame):
+    # Use completed candles only: discard the most recent potentially-forming candle.
+    df = add_indicators(raw.iloc[:-1].copy())
+    if len(df) < 80:
         return None
-    # Drop the last candle to reduce the risk of using an incomplete candle.
-    data = add_indicators(df.iloc[:-1].copy())
-    row = data.iloc[-1]
-    direction, score, reason = evaluate_row(row)
-    if direction is None:
+    row = df.iloc[-1]
+    direction, score = evaluate_row(row)
+    if not direction:
         return None
     return {
         "direction": direction,
-        "score": score,
-        "reason": reason,
-        "candle_time": data.index[-1],
-        "close": float(row["Close"]),
-        "rsi": float(row["RSI"]),
-        "adx": float(row["ADX"]),
-        "ema9": float(row["EMA9"]),
-        "ema21": float(row["EMA21"]),
+        "score": int(score),
+        "candle_time": str(df.index[-1]),
+        "entry_price": float(row["Close"]),
     }
 
 
-# -------------------- BACKTEST --------------------
-def run_backtest(symbol: str, period: str = PERIOD, interval: str = INTERVAL):
-    """
-    Basic historical test: signal at candle close, outcome at next candle close.
-    This is a simplified binary-style test, not broker execution simulation.
-    """
-    raw = download_candles(symbol, period=period, interval=interval)
-    df = add_indicators(raw)
-    wins = losses = ties = trades = 0
-    pnl = 0.0
+# ---------------- RESULTS / REPORTS ----------------
+def money(value: float) -> str:
+    return f"{value:+.2f}"
 
-    # Signal on bar i; evaluate direction from bar i to bar i+1 close.
-    # Uses only indicators calculated through bar i (no future indicator data).
-    for i in range(80, len(df) - EXPIRY_CANDLES):
-        row = df.iloc[i]
-        direction, _, _ = evaluate_row(row)
-        if direction is None:
-            continue
 
-        entry = float(df["Close"].iloc[i])
-        exit_price = float(df["Close"].iloc[i + EXPIRY_CANDLES])
-        trades += 1
-
-        if exit_price == entry:
-            ties += 1
-            continue
-
-        is_win = (direction == "CALL" and exit_price > entry) or (
-            direction == "PUT" and exit_price < entry
-        )
-        if is_win:
-            wins += 1
-            pnl += STAKE * PAYOUT
-        else:
-            losses += 1
-            pnl -= STAKE
-
+def stats():
+    completed = list(STATE["completed"].values())
+    wins = sum(1 for x in completed if x["result"] == "WIN")
+    losses = sum(1 for x in completed if x["result"] == "LOSS")
+    ties = sum(1 for x in completed if x["result"] == "TIE")
     decisive = wins + losses
-    win_rate = (wins / decisive * 100) if decisive else 0.0
-    return {
-        "symbol": symbol,
-        "candles": len(df),
-        "trades": trades,
-        "wins": wins,
-        "losses": losses,
-        "ties": ties,
-        "win_rate": win_rate,
-        "pnl": pnl,
-        "payout": PAYOUT,
-        "stake": STAKE,
-    }
+    win_rate = wins / decisive * 100 if decisive else 0.0
+    pnl = sum(float(x["pnl"]) for x in completed)
+    return wins, losses, ties, win_rate, pnl, len(completed)
 
 
-def format_backtest(result: dict, pair: str) -> str:
+def signal_message(pair: str, direction: str) -> str:
     return (
-        f"📊 BACKTEST REPORT — {pair}\n"
-        f"Market data: Yahoo Finance ({INTERVAL}, {PERIOD})\n"
-        f"Expiry model: {EXPIRY_CANDLES} candle(s)\n"
-        f"Total signals: {result['trades']}\n"
-        f"WIN: {result['wins']} | LOSS: {result['losses']} | TIE: {result['ties']}\n"
-        f"Win Rate (ties excluded): {result['win_rate']:.2f}%\n"
-        f"Estimated P/L: {result['pnl']:+.2f} stake units\n"
-        f"Payout assumed: {PAYOUT:.0%}\n\n"
-        "⚠️ Historical test only; real broker prices, payout, slippage and OTC data may differ."
+        "ALAMIN SIGNAL BOT\n\n"
+        "Non Mtg Signal\n\n"
+        f"PAIR : {pair} ( REAL MARKET )\n"
+        f"SIGNAL : {direction}\n"
+        "TIME : 1 MINUTE\n\n"
+        "ALAMIN SIGNAL"
     )
 
 
-# -------------------- TELEGRAM COMMANDS --------------------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🤖 ALAMIN AI SIGNAL BOT\n\n"
-        "Commands:\n"
-        "/signals — latest signals\n"
-        "/backtest — test all configured pairs\n"
-        "/backtest EURUSD — test one pair\n"
-        "/status — bot configuration\n\n"
-        "⚠️ Educational signals only. No accuracy or profit is guaranteed."
+def result_message(pair: str, result: str, pnl: float) -> str:
+    wins, losses, ties, win_rate, total_pnl, total = stats()
+    profit = max(pnl, 0.0)
+    loss = abs(min(pnl, 0.0))
+    return (
+        f"{pair} ( REAL MARKET )\n\n"
+        f"RESULT : {result}\n"
+        f"PROFIT : ${profit:.2f}\n"
+        f"LOSS : ${loss:.2f}\n"
+        f"TRADE P/L : {money(pnl)}\n"
+        f"TOTAL P/L : {money(total_pnl)}\n"
+        f"WIN RATE : {win_rate:.2f}% ({wins}W/{losses}L)\n\n"
+        "ALAMIN SIGNAL"
     )
-    await update.effective_message.reply_text(text)
 
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "⚙️ ALAMIN BOT STATUS\n"
-        f"Pairs: {', '.join(PAIRS.keys())}\n"
-        f"Interval: {INTERVAL}\n"
-        f"Backtest period: {PERIOD}\n"
-        f"Minimum score: {MIN_SCORE}/5\n"
-        f"Assumed payout: {PAYOUT:.0%}\n"
-        f"Backtest stake unit: {STAKE:g}\n"
-        f"Telegram chat configured: {'Yes' if CHAT_ID else 'No'}"
-    )
-    await update.effective_message.reply_text(text)
-
-
-async def send_latest_signals(application: Application, target_chat=None):
-    target = target_chat or CHAT_ID
-    if not target:
-        log.warning("TELEGRAM_CHAT_ID is not set; signals cannot be sent.")
+async def resolve_pending(application: Application, pair: str, symbol: str, raw: pd.DataFrame):
+    """Resolve pending signals when a later completed candle is available."""
+    pending_items = [
+        (sid, item) for sid, item in STATE["pending"].items()
+        if item.get("pair") == pair
+    ]
+    if not pending_items:
         return
 
-    sent_any = False
+    # Current latest completed candle; compare close with stored entry.
+    completed_df = raw.iloc[:-1]
+    if completed_df.empty:
+        return
+    latest_time = str(completed_df.index[-1])
+    latest_close = float(completed_df["Close"].iloc[-1])
+
+    for signal_id, item in pending_items:
+        # Do not resolve on the entry candle; wait for a later completed candle.
+        if latest_time == item.get("candle_time"):
+            continue
+        # Require timestamp to be later than the entry candle.
+        try:
+            if pd.Timestamp(latest_time) <= pd.Timestamp(item["candle_time"]):
+                continue
+        except Exception:
+            continue
+
+        entry = float(item["entry_price"])
+        direction = item["direction"]
+        if latest_close == entry:
+            result = "TIE"
+            pnl = 0.0
+        else:
+            won = (direction == "CALL" and latest_close > entry) or (
+                direction == "PUT" and latest_close < entry
+            )
+            if won:
+                result, pnl = "WIN", STAKE * PAYOUT
+            else:
+                result, pnl = "LOSS", -STAKE
+
+        # Persist completed state before sending: prevents duplicate result messages on restart.
+        STATE["completed"][signal_id] = {
+            **item,
+            "result": result,
+            "pnl": round(pnl, 8),
+            "result_candle_time": latest_time,
+            "result_price": latest_close,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        del STATE["pending"][signal_id]
+        save_state()
+
+        try:
+            await application.bot.send_message(
+                chat_id=item["chat_id"],
+                text=result_message(pair, result, pnl),
+            )
+        except Exception:
+            # The trade remains completed and won't be sent twice. Check logs if Telegram fails.
+            log.exception("Could not send result message for %s", signal_id)
+
+
+async def check_pairs(application: Application, target_chat=None):
+    target = target_chat or CHAT_ID
+    if not target:
+        log.warning("TELEGRAM_CHAT_ID not configured.")
+        return
+
     for pair, symbol in PAIRS.items():
         try:
             raw = download_candles(symbol)
-            signal = build_signal(raw)
+            await resolve_pending(application, pair, symbol, raw)
+
+            signal = build_latest_signal(raw)
             if not signal:
                 continue
 
-            candle_key = str(signal["candle_time"])
-            if LAST_SENT.get(pair) == candle_key:
+            # Stable ID from pair + completed candle timestamp.
+            signal_id = f"{pair}|{signal['candle_time']}"
+            if signal_id in STATE["pending"] or signal_id in STATE["completed"]:
+                continue
+            if STATE["last_signal_candle"].get(pair) == signal["candle_time"]:
                 continue
 
-            # A message is sent only after a completed candle passes filters.
-            msg = (
-                f"ALAMIN SIGNAL BOT\n"
-                f"Non Mtg Signal\n\n"
-                f"{pair} (REAL MARKET)\n"
-                f"SIGNAL: {signal['direction']}\n"
-                f"TIMEFRAME: {INTERVAL}\n"
-                f"CONFIRMATION: {signal['score']}/5\n"
-                f"RSI: {signal['rsi']:.1f} | ADX: {signal['adx']:.1f}\n"
-                f"EMA 9/21: {signal['ema9']:.5f} / {signal['ema21']:.5f}\n"
-                f"Completed candle: {signal['candle_time']}\n\n"
-                f"Reason: {signal['reason']}\n"
-                "⚠️ Experimental signal; verify on your broker before any trade."
-            )
-            await application.bot.send_message(chat_id=target, text=msg)
-            LAST_SENT[pair] = candle_key
-            sent_any = True
-        except Exception as exc:
-            log.exception("Signal check failed for %s: %s", pair, exc)
+            item = {
+                "pair": pair,
+                "symbol": symbol,
+                "direction": signal["direction"],
+                "score": signal["score"],
+                "candle_time": signal["candle_time"],
+                "entry_price": signal["entry_price"],
+                "chat_id": str(target),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            # Save before sending so repeated polling cannot create duplicate signals.
+            STATE["pending"][signal_id] = item
+            STATE["last_signal_candle"][pair] = signal["candle_time"]
+            save_state()
 
-    return sent_any
+            try:
+                await application.bot.send_message(
+                    chat_id=target,
+                    text=signal_message(pair, signal["direction"]),
+                )
+            except Exception:
+                # Remove pending record if signal was not delivered, allowing retry.
+                STATE["pending"].pop(signal_id, None)
+                STATE["last_signal_candle"].pop(pair, None)
+                save_state()
+                raise
+        except Exception as exc:
+            log.exception("Could not process %s: %s", pair, exc)
+
+
+# ---------------- COMMANDS ----------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "ALAMIN SIGNAL BOT\n\n"
+        "/signals - check signals now\n"
+        "/backtest - historical test for all pairs\n"
+        "/backtest EURUSD - test one pair\n"
+        "/stats - total completed result statistics\n"
+        "/status - configuration\n\n"
+        "Experimental signals only. No accuracy or profit is guaranteed."
+    )
 
 
 async def signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Checking latest completed candles...")
-    await send_latest_signals(context.application, target_chat=update.effective_chat.id)
+    await update.effective_message.reply_text("Checking completed candles...")
+    await check_pairs(context.application, target_chat=update.effective_chat.id)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wins, losses, ties, rate, pnl, total = stats()
+    await update.effective_message.reply_text(
+        "ALAMIN SIGNAL — TOTAL RESULT\n\n"
+        f"TOTAL RESULT : {total}\n"
+        f"WIN : {wins}\n"
+        f"LOSS : {losses}\n"
+        f"TIE : {ties}\n"
+        f"WIN RATE : {rate:.2f}%\n"
+        f"TOTAL PROFIT/LOSS : {money(pnl)}\n\n"
+        "ALAMIN SIGNAL"
+    )
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "ALAMIN BOT STATUS\n"
+        f"Pairs: {', '.join(PAIRS.keys())}\n"
+        f"Interval: {INTERVAL}\n"
+        f"Period: {PERIOD}\n"
+        f"Minimum score: {MIN_SCORE}/5\n"
+        f"Payout assumption: {PAYOUT:.0%}\n"
+        f"Stake per result: ${STAKE:.2f}\n"
+        f"State file: {STATE_FILE}\n"
+        "Note: use persistent storage for state.json to preserve duplicate protection."
+    )
 
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Running historical backtest. Please wait...")
-    args = context.args
-    if args:
-        query = args[0].upper().replace("/", "").replace("-", "")
-        matches = [(pair, sym) for pair, sym in PAIRS.items()
-                   if pair.replace("/", "") == query or sym.replace("=X", "") == query]
-        if not matches:
+    await update.effective_message.reply_text("Running backtest. Please wait...")
+    selected = list(PAIRS.items())
+    if context.args:
+        query = context.args[0].upper().replace("/", "").replace("-", "")
+        selected = [
+            (pair, symbol) for pair, symbol in PAIRS.items()
+            if pair.replace("/", "") == query or symbol.replace("=X", "").upper() == query
+        ]
+        if not selected:
             await update.effective_message.reply_text(
-                "Unknown pair. Try /backtest EURUSD or /backtest GBPUSD."
+                "Unknown pair. Try /backtest EURUSD, /backtest GBPUSD, /backtest USDJPY."
             )
             return
-        selected = matches
-    else:
-        selected = list(PAIRS.items())
 
     for pair, symbol in selected:
         try:
-            result = run_backtest(symbol)
-            await update.effective_message.reply_text(format_backtest(result, pair))
+            raw = download_candles(symbol)
+            df = add_indicators(raw)
+            wins = losses = ties = trades = 0
+            pnl = 0.0
+            for i in range(80, len(df) - 1):
+                direction, _ = evaluate_row(df.iloc[i])
+                if not direction:
+                    continue
+                trades += 1
+                entry = float(df["Close"].iloc[i])
+                exit_price = float(df["Close"].iloc[i + 1])
+                if entry == exit_price:
+                    ties += 1
+                elif (direction == "CALL" and exit_price > entry) or (
+                    direction == "PUT" and exit_price < entry
+                ):
+                    wins += 1
+                    pnl += STAKE * PAYOUT
+                else:
+                    losses += 1
+                    pnl -= STAKE
+            rate = wins / (wins + losses) * 100 if wins + losses else 0.0
+            await update.effective_message.reply_text(
+                f"BACKTEST — {pair}\n\n"
+                f"TOTAL SIGNALS : {trades}\n"
+                f"WIN : {wins} | LOSS : {losses} | TIE : {ties}\n"
+                f"WIN RATE : {rate:.2f}%\n"
+                f"ESTIMATED P/L : {money(pnl)}\n"
+                f"PAYOUT ASSUMED : {PAYOUT:.0%}\n\n"
+                "Historical approximation only; not a broker-execution result."
+            )
         except Exception as exc:
             log.exception("Backtest failed for %s", pair)
-            await update.effective_message.reply_text(
-                f"Backtest failed for {pair}: {exc}\n"
-                "Check data availability and try again later."
-            )
+            await update.effective_message.reply_text(f"Backtest failed for {pair}: {exc}")
 
 
-async def scheduled_signal_job(context: ContextTypes.DEFAULT_TYPE):
-    await send_latest_signals(context.application)
+async def scheduled_check(context: ContextTypes.DEFAULT_TYPE):
+    await check_pairs(context.application)
 
 
 async def post_init(application: Application):
-    # JobQueue is available when python-telegram-bot[job-queue] is installed.
-    if application.job_queue is not None:
-        application.job_queue.run_repeating(
-            scheduled_signal_job,
-            interval=SIGNAL_INTERVAL_SECONDS,
-            first=10,
-            name="signal_loop",
-        )
-        log.info("Scheduled signal loop started.")
-    else:
-        log.error("JobQueue missing. Install python-telegram-bot[job-queue].")
+    if application.job_queue is None:
+        log.error("JobQueue unavailable. Install python-telegram-bot[job-queue].")
+        return
+    application.job_queue.run_repeating(
+        scheduled_check,
+        interval=max(20, SIGNAL_LOOP_SECONDS),
+        first=10,
+        name="signal-check",
+    )
 
 
 def main():
     if not BOT_TOKEN:
-        raise SystemExit(
-            "Missing TELEGRAM_BOT_TOKEN environment variable. "
-            "Set it in GitHub Secrets; never hardcode your token."
-        )
-
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+        raise SystemExit("Missing TELEGRAM_BOT_TOKEN environment variable.")
+    load_state()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("signals", signals_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("backtest", backtest_command))
-    log.info("ALAMIN AI SIGNAL BOT starting...")
+    log.info("ALAMIN AI SIGNAL BOT started.")
     app.run_polling(drop_pending_updates=True)
 
 
