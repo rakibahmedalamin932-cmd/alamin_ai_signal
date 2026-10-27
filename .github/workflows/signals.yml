@@ -1,20 +1,32 @@
-name: Alamin Signal Bot
+
+name: ALAMIN EURJPY Signal Bot
 
 on:
   workflow_dispatch:
+  schedule:
+    # Restart approximately every 6 hours
+    - cron: "17 */6 * * *"
 
 permissions:
   contents: read
 
+concurrency:
+  group: alamin-eurjpy-signal-bot
+  cancel-in-progress: false
+
 jobs:
-  signal:
+  run-bot:
+    name: Run EURJPY Only Bot
     runs-on: ubuntu-latest
+
+    # Leave time for GitHub Actions to shut down cleanly
     timeout-minutes: 350
+
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      PAYOUT: "0.80"
-      STAKE: "1.00"
+      CHAT_ID: ${{ secrets.CHAT_ID }}
+      PYTHONUNBUFFERED: "1"
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,11 +34,30 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: "pip"
 
-      - name: Install requirements
-        run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run bot
-        run: python main.py
+      - name: Prepare bot state
+        run: |
+          if [ ! -f bot_state.json ]; then
+            echo '{"last_signal_candle": ""}' > bot_state.json
+          fi
+
+      - name: Validate required secrets
+        run: |
+          test -n "$TELEGRAM_BOT_TOKEN" || {
+            echo "TELEGRAM_BOT_TOKEN secret is missing"
+            exit 1
+          }
+          test -n "$CHAT_ID" || {
+            echo "CHAT_ID secret is missing"
+            exit 1
+          }
+
+      - name: Start EURJPY bot
+        run: python -u main.py
