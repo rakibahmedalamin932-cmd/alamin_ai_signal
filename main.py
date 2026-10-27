@@ -269,9 +269,16 @@ def send_signal(pair, df, direction, score, strategy, state):
         f"DIRECTION : {direction}\n\n"
         f"SIGNAL BY - {SIGNAL_BY}"
     )
-    chart_path = make_chart(df, pair, direction)
-    with open(chart_path, "rb") as photo:
-        telegram("sendPhoto", chat_id=CHAT_ID, photo=photo, caption=message)
+    # Send the actual signal as plain text first so chart generation/upload
+    # cannot prevent the primary signal from reaching Telegram.
+    send_text(message)
+    try:
+        chart_path = make_chart(df, pair, direction)
+        with open(chart_path, "rb") as photo:
+            telegram("sendPhoto", chat_id=CHAT_ID, photo=photo, caption=f"{pair} | {direction} | 1-minute chart")
+    except Exception:
+        logging.exception("Chart creation/upload failed for %s; text signal was already sent", pair)
+
     state["sent_keys"].append(key)
     state["sent_keys"] = state["sent_keys"][-500:]
     state["pending"].append({
@@ -346,17 +353,29 @@ def main():
 
     state = load_state()
     settle_pending(state)
+    sent_before = len(state["sent_keys"])
+    errors = []
     for pair in PAIRS:
         try:
             df = fetch_candles(pair)
             direction, score, strategy = get_signal(df)
             if direction is None:
-                logging.info("No signal for %s: %s", pair, strategy)
+                logging.warning("No signal for %s: %s", pair, strategy)
+                errors.append(f"{pair}: no direction returned ({strategy})")
                 continue
             send_signal(pair, df, direction, score, strategy, state)
         except Exception as exc:
             logging.exception("Pair failed (%s): %s", pair, exc)
+            errors.append(f"{pair}: {str(exc)[:180]}")
         time.sleep(1)
+
+    # If no new signal was sent, send a concise diagnostic so the bot does not
+    # appear silent. This is not a trading signal.
+    if len(state["sent_keys"]) == sent_before and errors:
+        try:
+            send_text("ALAMIN SIGNAL BOT - DIAGNOSTIC\nNo signal sent this run.\n" + "\n".join(errors[:4]))
+        except Exception:
+            logging.exception("Could not send diagnostic message to Telegram")
     save_state(state)
 
 
