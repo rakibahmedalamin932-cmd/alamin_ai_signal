@@ -176,65 +176,120 @@ def add_indicators(df):
 
 
 def get_signal(df):
+    """
+    Multi-confluence 1-minute signal:
+    trend (EMA), ADX/DI, MACD, RSI, stochastic, Supertrend,
+    candle pattern and breakout/structure. Strict scoring aims to
+    filter weak setups; it cannot guarantee a particular win rate.
+    """
     d = add_indicators(df)
+    if len(d) < 210:
+        raise RuntimeError("Need at least 210 candles for EMA200")
     x, prev = d.iloc[-1], d.iloc[-2]
-    values = [x.get(k, np.nan) for k in (
+
+    required = [
         "ema9", "ema21", "ema50", "ema200", "rsi", "macd",
         "macd_signal", "macd_hist", "stoch_k", "stoch_d",
         "bb_upper", "bb_lower", "atr", "adx", "plus_di", "minus_di",
-        "resistance", "support"
-    )]
-    if not np.isfinite(np.array(values, dtype=float)).all():
-        raise RuntimeError("Indicators are not ready yet")
+        "resistance", "support", "supertrend_dir"
+    ]
+    if not np.isfinite(np.array([x[k] for k in required], dtype=float)).all():
+        raise RuntimeError("Indicator data is incomplete")
 
     call = 0
     put = 0
+    reasons_call, reasons_put = [], []
 
-    # Trend / EMA alignment
-    if x.ema9 > x.ema21: call += 1
-    elif x.ema9 < x.ema21: put += 1
-    if x.ema50 > x.ema200: call += 1
-    elif x.ema50 < x.ema200: put += 1
+    # Main trend alignment (stronger weight)
+    if x.ema9 > x.ema21 and x.close > x.ema50:
+        call += 2
+        reasons_call.append("EMA trend")
+    elif x.ema9 < x.ema21 and x.close < x.ema50:
+        put += 2
+        reasons_put.append("EMA trend")
 
-    # ADX directional confirmation
-    if x.adx >= 18:
-        if x.plus_di > x.minus_di: call += 1
-        elif x.minus_di > x.plus_di: put += 1
+    # Long trend filter
+    if x.ema50 > x.ema200:
+        call += 1
+        reasons_call.append("long trend")
+    elif x.ema50 < x.ema200:
+        put += 1
+        reasons_put.append("long trend")
 
-    # Momentum
-    if x.macd > x.macd_signal and x.macd_hist > prev.macd_hist: call += 1
-    elif x.macd < x.macd_signal and x.macd_hist < prev.macd_hist: put += 1
-    if 50 < x.rsi < 70: call += 1
-    elif 30 < x.rsi < 50: put += 1
-    if x.stoch_k > x.stoch_d and x.stoch_k < 80: call += 1
-    elif x.stoch_k < x.stoch_d and x.stoch_k > 20: put += 1
+    # ADX / directional movement confirmation
+    if x.adx >= 20:
+        if x.plus_di > x.minus_di:
+            call += 1
+            reasons_call.append("ADX/DI")
+        elif x.minus_di > x.plus_di:
+            put += 1
+            reasons_put.append("ADX/DI")
 
-    # Supertrend
-    if x.supertrend_dir == 1: call += 1
-    elif x.supertrend_dir == -1: put += 1
+    # MACD momentum
+    if x.macd > x.macd_signal and x.macd_hist >= prev.macd_hist:
+        call += 1
+        reasons_call.append("MACD")
+    elif x.macd < x.macd_signal and x.macd_hist <= prev.macd_hist:
+        put += 1
+        reasons_put.append("MACD")
 
-    # Price action: breakout / retest proxy and candle patterns
-    if x.close > x.resistance: call += 1
-    elif x.close < x.support: put += 1
-    if bool(x.bull_engulf or x.bull_pin): call += 1
-    if bool(x.bear_engulf or x.bear_pin): put += 1
+    # RSI: avoid chasing extreme readings
+    if 52 <= x.rsi <= 68:
+        call += 1
+        reasons_call.append("RSI")
+    elif 32 <= x.rsi <= 48:
+        put += 1
+        reasons_put.append("RSI")
 
-    # Always produce a direction when valid candle data and indicators exist.
-    # Note: this increases signal frequency, NOT guaranteed accuracy.
-    if call > put:
-        return "CALL", call, "Trend + Momentum + Price Action"
-    if put > call:
-        return "PUT", put, "Trend + Momentum + Price Action"
+    # Stochastic cross/confirmation
+    if x.stoch_k > x.stoch_d and x.stoch_k < 80:
+        call += 1
+        reasons_call.append("Stochastic")
+    elif x.stoch_k < x.stoch_d and x.stoch_k > 20:
+        put += 1
+        reasons_put.append("Stochastic")
 
-    # Tie-break using the short-term trend, then price vs EMA50.
-    if x.ema9 > x.ema21:
-        return "CALL", call, "EMA tie-break"
-    if x.ema9 < x.ema21:
-        return "PUT", put, "EMA tie-break"
-    if x.close >= x.ema50:
-        return "CALL", call, "EMA50 tie-break"
-    return "PUT", put, "EMA50 tie-break"
+    # Supertrend confirmation
+    if x.supertrend_dir == 1:
+        call += 1
+        reasons_call.append("Supertrend")
+    elif x.supertrend_dir == -1:
+        put += 1
+        reasons_put.append("Supertrend")
 
+    # Price action confirmation
+    if bool(x.bull_engulf or x.bull_pin):
+        call += 1
+        reasons_call.append("bullish candle")
+    if bool(x.bear_engulf or x.bear_pin):
+        put += 1
+        reasons_put.append("bearish candle")
+
+    # Breakout confirmation. Use previous rolling level to avoid current-bar leakage.
+    if x.close > x.resistance:
+        call += 1
+        reasons_call.append("breakout")
+    elif x.close < x.support:
+        put += 1
+        reasons_put.append("breakdown")
+
+    # Avoid abnormal candle spikes and very low ADX / flat markets.
+    candle_range = float(x["high"] - x["low"])
+    if not np.isfinite(x.atr) or x.atr <= 0:
+        raise RuntimeError("ATR is invalid")
+    if candle_range > 2.2 * x.atr:
+        return None, max(call, put), "Skipped: abnormal volatility spike"
+    if x.adx < 12:
+        return None, max(call, put), "Skipped: market trend too weak"
+
+    # Require a useful score and at least 2-point directional separation.
+    # This intentionally filters weak setups instead of forcing random directions.
+    if call >= 6 and call >= put + 2:
+        return "CALL", call, "EMA + ADX + MACD + RSI/Stochastic + Supertrend + Price Action"
+    if put >= 6 and put >= call + 2:
+        return "PUT", put, "EMA + ADX + MACD + RSI/Stochastic + Supertrend + Price Action"
+
+    return None, max(call, put), f"Filtered weak setup (CALL {call}, PUT {put})"
 
 def make_chart(df, pair, direction):
     d = df.tail(60)
@@ -265,6 +320,7 @@ def send_signal(pair, df, direction, score, strategy, state):
         return None
 
     message = (
+        f"Non Mtg Signal\n"
         f"PAIR : {pair}\n"
         f"ENTRY TIME : {entry.strftime('%H:%M')}\n"
         f"CLOSING TIME : {closing.strftime('%H:%M')}\n"
@@ -328,12 +384,15 @@ def wait_for_result(trade, state, max_wait_seconds=300):
                     result = "LOSS"
                     state["losses"] += 1
 
+                total = state["wins"] + state["losses"]
+                win_rate = (state["wins"] / total * 100.0) if total else 0.0
                 message = (
                     f"PAIR : {trade['pair']}\n"
                     f"ENTRY TIME : {entry_time.strftime('%H:%M')}\n"
                     f"RESULT : {result}\n"
                     f"WIN : {state['wins']}\n"
-                    f"LOSS : {state['losses']}\n\n"
+                    f"LOSS : {state['losses']}\n"
+                    f"WIN RATE : {win_rate:.1f}%\n\n"
                     f"SIGNAL BY {SIGNAL_BY}"
                 )
                 send_text(message)
@@ -394,7 +453,7 @@ def main():
         try:
             send_text(
                 "ALAMIN SIGNAL BOT - NO SIGNAL\n"
-                "No valid market analysis was available this run.\n"
+                "No setup passed the stronger analysis filters this run.\n"
                 + ("\n".join(errors[:4]) if errors else "Please check market data.")
             )
         except Exception:
