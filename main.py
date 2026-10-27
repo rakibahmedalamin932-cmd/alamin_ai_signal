@@ -1,17 +1,16 @@
 """
 ALAMIN AI SIGNAL BOT
-- Compact Telegram signal format
+- One active signal/trade at a time across all pairs
+- Signal message includes Bangladesh-time ENTRY TIME and CLOSING TIME
 - EMA 9/21 + RSI + MACD + ADX + ATR + candle confirmation
-- Historical backtest command: /backtest and /backtest EURUSD
-- Automatic one-candle result message, exactly once per signal ID while state persists
-- Win rate and profit/loss calculated from completed signals and configured payout
+- /backtest, /backtest EURUSD, /stats, /status
+- Results are estimates based on Yahoo Finance candles, not broker execution
 
 Important:
-* Experimental tool, not financial advice and no accuracy/profit is guaranteed.
-* Yahoo Finance data is not the same as a broker feed and does not provide reliable OTC prices.
-* This bot stores state in state.json. GitHub-hosted runners may discard local files between runs;
-  for continuous, duplicate-safe operation use a persistent host or persist state.json between runs.
-* A signal is generated from a completed candle; result is checked against the next candle close.
+- Experimental signals only; no accuracy or profit is guaranteed.
+- Yahoo Finance data is not a broker feed and does not provide reliable OTC prices.
+- Persist state.json between runs to preserve duplicate protection.
+- Signal timing is approximate; actual execution and broker candle boundaries may differ.
 """
 
 import os
@@ -19,7 +18,8 @@ import json
 import logging
 import asyncio
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yfinance as yf
@@ -44,11 +44,12 @@ PAIRS = {
 
 INTERVAL = os.getenv("INTERVAL", "1m")
 PERIOD = os.getenv("PERIOD", "7d")
-PAYOUT = float(os.getenv("PAYOUT", "0.80"))  # 0.80 means 80% net profit on a win
-STAKE = float(os.getenv("STAKE", "1.00"))    # result accounting currency/unit
+PAYOUT = float(os.getenv("PAYOUT", "0.80"))
+STAKE = float(os.getenv("STAKE", "1.00"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "4"))
 SIGNAL_LOOP_SECONDS = int(os.getenv("SIGNAL_LOOP_SECONDS", "30"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
+LOCAL_TZ = ZoneInfo("Asia/Dhaka")
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -56,12 +57,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("alamin-signal")
 
-# state schema:
-# {
-#   "last_signal_candle": {"EUR/USD": "timestamp"},
-#   "pending": {"signal_id": {...}},
-#   "completed": {"signal_id": {...}}
-# }
 STATE = {"last_signal_candle": {}, "pending": {}, "completed": {}}
 STATE_LOCK = asyncio.Lock()
 
@@ -85,10 +80,26 @@ def load_state():
 
 
 def save_state():
-    """Atomic local state write to reduce corruption risk."""
     tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
     tmp.write_text(json.dumps(STATE, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(STATE_FILE)
+
+
+# ---------------- TIME HELPERS ----------------
+def local_time_text(value) -> str:
+    """Convert a timestamp to Bangladesh time and format HH:MM."""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert("Asia/Dhaka").strftime("%H:%M")
+
+
+def planned_entry_times() -> tuple[str, str]:
+    """Use the next full Bangladesh-time minute as planned entry, then +1 minute close."""
+    now = datetime.now(LOCAL_TZ)
+    entry = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    closing = entry + timedelta(minutes=1)
+    return entry.strftime("%H:%M"), closing.strftime("%H:%M")
 
 
 # ---------------- MARKET DATA ----------------
@@ -136,7 +147,8 @@ def add_indicators(raw: pd.DataFrame) -> pd.DataFrame:
 
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
-    df["MACD_HIST"] = (ema12 - ema26) - (ema12 - ema26).ewm(span=9, adjust=False).mean()
+    macd = ema12 - ema26
+    df["MACD_HIST"] = macd - macd.ewm(span=9, adjust=False).mean()
 
     prev_close = close.shift(1)
     tr = pd.concat(
@@ -150,8 +162,16 @@ def add_indicators(raw: pd.DataFrame) -> pd.DataFrame:
     plus_dm = up.where((up > down) & (up > 0), 0.0)
     minus_dm = down.where((down > up) & (down > 0), 0.0)
     atr_safe = df["ATR"].replace(0, float("nan"))
-    plus_di = 100 * plus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean() / atr_safe
-    minus_di = 100 * minus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean() / atr_safe
+    plus_di = (
+        100
+        * plus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+        / atr_safe
+    )
+    minus_di = (
+        100
+        * minus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+        / atr_safe
+    )
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, float("nan"))
     df["ADX"] = dx.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean().fillna(0)
     df["PLUS_DI"] = plus_di.fillna(0)
@@ -166,7 +186,6 @@ def evaluate_row(row: pd.Series):
     needed = ["EMA9", "EMA21", "RSI", "MACD_HIST", "ADX", "ATR", "AVG_BODY"]
     if any(pd.isna(row.get(k)) for k in needed):
         return None, 0
-
     if row["ADX"] < 15 or row["ATR"] <= 0 or row["AVG_BODY"] <= 0:
         return None, 0
     if row["BODY"] > row["ATR"] * 1.8:
@@ -206,7 +225,7 @@ def evaluate_row(row: pd.Series):
 
 
 def build_latest_signal(raw: pd.DataFrame):
-    # Use completed candles only: discard the most recent potentially-forming candle.
+    # Ignore the most recent possibly-forming candle.
     df = add_indicators(raw.iloc[:-1].copy())
     if len(df) < 80:
         return None
@@ -229,21 +248,23 @@ def money(value: float) -> str:
 
 def stats():
     completed = list(STATE["completed"].values())
-    wins = sum(1 for x in completed if x["result"] == "WIN")
-    losses = sum(1 for x in completed if x["result"] == "LOSS")
-    ties = sum(1 for x in completed if x["result"] == "TIE")
+    wins = sum(1 for x in completed if x.get("result") == "WIN")
+    losses = sum(1 for x in completed if x.get("result") == "LOSS")
+    ties = sum(1 for x in completed if x.get("result") == "TIE")
     decisive = wins + losses
     win_rate = wins / decisive * 100 if decisive else 0.0
-    pnl = sum(float(x["pnl"]) for x in completed)
+    pnl = sum(float(x.get("pnl", 0)) for x in completed)
     return wins, losses, ties, win_rate, pnl, len(completed)
 
 
-def signal_message(pair: str, direction: str) -> str:
+def signal_message(pair: str, direction: str, entry_time: str, closing_time: str) -> str:
     return (
         "ALAMIN SIGNAL BOT\n\n"
         "Non Mtg Signal\n\n"
         f"PAIR : {pair} ( REAL MARKET )\n"
         f"SIGNAL : {direction}\n"
+        f"ENTRY TIME : {entry_time} (BDT)\n"
+        f"CLOSING TIME : {closing_time} (BDT)\n"
         "TIME : 1 MINUTE\n\n"
         "ALAMIN SIGNAL"
     )
@@ -265,8 +286,8 @@ def result_message(pair: str, result: str, pnl: float) -> str:
     )
 
 
-async def resolve_pending(application: Application, pair: str, symbol: str, raw: pd.DataFrame):
-    """Resolve pending signals when a later completed candle is available."""
+async def resolve_pending(application: Application, pair: str, raw: pd.DataFrame):
+    """Resolve this pair's pending signal using the next later completed candle."""
     pending_items = [
         (sid, item) for sid, item in STATE["pending"].items()
         if item.get("pair") == pair
@@ -274,7 +295,6 @@ async def resolve_pending(application: Application, pair: str, symbol: str, raw:
     if not pending_items:
         return
 
-    # Current latest completed candle; compare close with stored entry.
     completed_df = raw.iloc[:-1]
     if completed_df.empty:
         return
@@ -282,10 +302,6 @@ async def resolve_pending(application: Application, pair: str, symbol: str, raw:
     latest_close = float(completed_df["Close"].iloc[-1])
 
     for signal_id, item in pending_items:
-        # Do not resolve on the entry candle; wait for a later completed candle.
-        if latest_time == item.get("candle_time"):
-            continue
-        # Require timestamp to be later than the entry candle.
         try:
             if pd.Timestamp(latest_time) <= pd.Timestamp(item["candle_time"]):
                 continue
@@ -295,10 +311,11 @@ async def resolve_pending(application: Application, pair: str, symbol: str, raw:
         entry = float(item["entry_price"])
         direction = item["direction"]
         if latest_close == entry:
-            result = "TIE"
-            pnl = 0.0
+            result, pnl = "TIE", 0.0
         else:
-            won = (direction == "CALL" and latest_close > entry) or (
+            won = (
+                direction == "CALL" and latest_close > entry
+            ) or (
                 direction == "PUT" and latest_close < entry
             )
             if won:
@@ -306,7 +323,6 @@ async def resolve_pending(application: Application, pair: str, symbol: str, raw:
             else:
                 result, pnl = "LOSS", -STAKE
 
-        # Persist completed state before sending: prevents duplicate result messages on restart.
         STATE["completed"][signal_id] = {
             **item,
             "result": result,
@@ -324,60 +340,80 @@ async def resolve_pending(application: Application, pair: str, symbol: str, raw:
                 text=result_message(pair, result, pnl),
             )
         except Exception:
-            # The trade remains completed and won't be sent twice. Check logs if Telegram fails.
             log.exception("Could not send result message for %s", signal_id)
 
 
 async def check_pairs(application: Application, target_chat=None):
-    target = target_chat or CHAT_ID
+    target = str(target_chat or CHAT_ID).strip()
     if not target:
         log.warning("TELEGRAM_CHAT_ID not configured.")
         return
 
-    for pair, symbol in PAIRS.items():
-        try:
-            raw = download_candles(symbol)
-            await resolve_pending(application, pair, symbol, raw)
+    async with STATE_LOCK:
+        # If a trade was already active at the start of this check, only try to
+        # resolve it. Do not send another signal during this same polling pass.
+        active_at_start = bool(STATE["pending"])
 
-            signal = build_latest_signal(raw)
-            if not signal:
-                continue
-
-            # Stable ID from pair + completed candle timestamp.
-            signal_id = f"{pair}|{signal['candle_time']}"
-            if signal_id in STATE["pending"] or signal_id in STATE["completed"]:
-                continue
-            if STATE["last_signal_candle"].get(pair) == signal["candle_time"]:
-                continue
-
-            item = {
-                "pair": pair,
-                "symbol": symbol,
-                "direction": signal["direction"],
-                "score": signal["score"],
-                "candle_time": signal["candle_time"],
-                "entry_price": signal["entry_price"],
-                "chat_id": str(target),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            # Save before sending so repeated polling cannot create duplicate signals.
-            STATE["pending"][signal_id] = item
-            STATE["last_signal_candle"][pair] = signal["candle_time"]
-            save_state()
-
+        for pair, symbol in PAIRS.items():
             try:
-                await application.bot.send_message(
-                    chat_id=target,
-                    text=signal_message(pair, signal["direction"]),
-                )
-            except Exception:
-                # Remove pending record if signal was not delivered, allowing retry.
-                STATE["pending"].pop(signal_id, None)
-                STATE["last_signal_candle"].pop(pair, None)
+                raw = download_candles(symbol)
+                await resolve_pending(application, pair, raw)
+            except Exception as exc:
+                log.exception("Could not check pending result for %s: %s", pair, exc)
+
+        if active_at_start or STATE["pending"]:
+            return
+
+        # No active trade: scan pairs in order and send ONLY the first valid signal.
+        for pair, symbol in PAIRS.items():
+            try:
+                raw = download_candles(symbol)
+                signal = build_latest_signal(raw)
+                if not signal:
+                    continue
+
+                signal_id = f"{pair}|{signal['candle_time']}"
+                if signal_id in STATE["completed"] or signal_id in STATE["pending"]:
+                    continue
+                if STATE["last_signal_candle"].get(pair) == signal["candle_time"]:
+                    continue
+
+                entry_time, closing_time = planned_entry_times()
+                item = {
+                    "pair": pair,
+                    "symbol": symbol,
+                    "direction": signal["direction"],
+                    "score": signal["score"],
+                    "candle_time": signal["candle_time"],
+                    "entry_price": signal["entry_price"],
+                    "entry_time": entry_time,
+                    "closing_time": closing_time,
+                    "chat_id": target,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+
+                # Save before sending to avoid duplicates after a restart.
+                STATE["pending"][signal_id] = item
+                STATE["last_signal_candle"][pair] = signal["candle_time"]
                 save_state()
-                raise
-        except Exception as exc:
-            log.exception("Could not process %s: %s", pair, exc)
+
+                try:
+                    await application.bot.send_message(
+                        chat_id=target,
+                        text=signal_message(
+                            pair, signal["direction"], entry_time, closing_time
+                        ),
+                    )
+                except Exception:
+                    STATE["pending"].pop(signal_id, None)
+                    STATE["last_signal_candle"].pop(pair, None)
+                    save_state()
+                    raise
+
+                # Critical: return immediately after one signal.
+                return
+            except Exception as exc:
+                log.exception("Could not process %s: %s", pair, exc)
 
 
 # ---------------- COMMANDS ----------------
@@ -389,12 +425,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/backtest EURUSD - test one pair\n"
         "/stats - total completed result statistics\n"
         "/status - configuration\n\n"
-        "Experimental signals only. No accuracy or profit is guaranteed."
+        "Only one active signal at a time. Experimental signals; no accuracy or profit is guaranteed."
     )
 
 
 async def signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Checking completed candles...")
+    await update.effective_message.reply_text("Checking market data...")
     await check_pairs(context.application, target_chat=update.effective_chat.id)
 
 
@@ -421,8 +457,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Minimum score: {MIN_SCORE}/5\n"
         f"Payout assumption: {PAYOUT:.0%}\n"
         f"Stake per result: ${STAKE:.2f}\n"
+        f"Active trades: {len(STATE['pending'])}\n"
         f"State file: {STATE_FILE}\n"
-        "Note: use persistent storage for state.json to preserve duplicate protection."
+        "Time zone: Asia/Dhaka (BDT)\n"
+        "Note: persistent storage is needed to preserve state.json between restarts."
     )
 
 
@@ -437,7 +475,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         if not selected:
             await update.effective_message.reply_text(
-                "Unknown pair. Try /backtest EURUSD, /backtest GBPUSD, /backtest USDJPY."
+                "Unknown pair. Try /backtest EURUSD, /backtest GBPUSD, /backtest USDJPY, or /backtest EURJPY."
             )
             return
 
@@ -456,7 +494,9 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 exit_price = float(df["Close"].iloc[i + 1])
                 if entry == exit_price:
                     ties += 1
-                elif (direction == "CALL" and exit_price > entry) or (
+                elif (
+                    direction == "CALL" and exit_price > entry
+                ) or (
                     direction == "PUT" and exit_price < entry
                 ):
                     wins += 1
@@ -464,6 +504,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     losses += 1
                     pnl -= STAKE
+
             rate = wins / (wins + losses) * 100 if wins + losses else 0.0
             await update.effective_message.reply_text(
                 f"BACKTEST — {pair}\n\n"
