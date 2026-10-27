@@ -1,4 +1,3 @@
-
 name: Alamin Signal Bot
 
 on:
@@ -6,12 +5,22 @@ on:
   schedule:
     - cron: "*/5 * * * *"
 
+permissions:
+  contents: write
+
+concurrency:
+  group: alamin-signal-bot
+  cancel-in-progress: false
+
 jobs:
   signal:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,4 +35,19 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          PAIRS: "EUR/JPY,EUR/USD,GBP/USD,USD/JPY"
+          TZ: "Asia/Dhaka"
         run: python main.py
+
+      - name: Save cumulative WIN/LOSS state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add signal_state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update signal result statistics"
+            git push
+          else
+            echo "No state changes to save."
+          fi
